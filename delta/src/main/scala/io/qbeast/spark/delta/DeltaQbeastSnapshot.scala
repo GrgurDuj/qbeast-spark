@@ -22,6 +22,7 @@ import io.qbeast.spark.utils.TagColumns
 import io.qbeast.IISeq
 import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.FileSystem
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.files.TahoeLogFileIndex
@@ -101,6 +102,52 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
     }
   }
 
+  // Cache for index metadata file to support read path
+  private lazy val indexMetadataCache: Map[String, (Long, String)] = {
+    try {
+      val indexMetadataPath = new Path(basePath, ".qbeast_index/tags.json")
+      val fs = FileSystem.get(indexMetadataPath.toUri, new org.apache.hadoop.conf.Configuration())
+      
+      if (fs.exists(indexMetadataPath)) {
+        val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+          .registerModule(new com.fasterxml.jackson.module.scala.DefaultScalaModule())
+        val content = scala.io.Source.fromInputStream(fs.open(indexMetadataPath)).mkString
+        val jsonNode = mapper.readTree(content)
+        
+        val metadataMap = scala.collection.mutable.Map[String, (Long, String)]()
+        val revisionsNode = jsonNode.get("revisions")
+        if (revisionsNode != null && revisionsNode.isArray) {
+          val iterator = revisionsNode.elements()
+          while (iterator.hasNext) {
+            val revisionNode = iterator.next()
+            val revisionID = if (revisionNode.get("revisionID") != null) 
+              revisionNode.get("revisionID").asLong() else 0L
+            val filesNode = revisionNode.get("files")
+            if (filesNode != null && filesNode.isArray) {
+              val fileIterator = filesNode.elements()
+              while (fileIterator.hasNext) {
+                val fileNode = fileIterator.next()
+                val path = fileNode.get("path")
+                if (path != null) {
+                  val blocksStr = if (fileNode.get("tags") != null && 
+                    fileNode.get("tags").get("blocks") != null) {
+                    fileNode.get("tags").get("blocks").asText()
+                  } else ""
+                  metadataMap(path.asText()) = (revisionID, blocksStr)
+                }
+              }
+            }
+          }
+        }
+        metadataMap.toMap
+      } else {
+        Map.empty[String, (Long, String)]
+      }
+    } catch {
+      case _: Exception => Map.empty[String, (Long, String)]
+    }
+  }
+
   /**
    * Returns last available revision identifier
    *
@@ -163,11 +210,12 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
 
   override def loadIndexFiles(revisionID: RevisionID): Dataset[IndexFile] = {
     val dimensionCount = loadRevision(revisionID).transformations.size
+    val metadata = indexMetadataCache // Capture the cache
     val addFiles =
       if (isStaging(revisionID)) loadStagingFiles()
       else snapshot.allFiles.where(TagColumns.revision === lit(revisionID.toString))
     import addFiles.sparkSession.implicits._
-    addFiles.map(DeltaQbeastFileUtils.fromAddFile(dimensionCount))
+    addFiles.map(DeltaQbeastFileUtils.fromAddFile(dimensionCount, metadata))
   }
 
   /**

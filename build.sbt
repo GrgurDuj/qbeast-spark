@@ -192,8 +192,11 @@ Compile / compile := (Compile / compile).dependsOn(Compile / scalafmtCheck).valu
 Test / compile := (Test / compile).dependsOn(Test / scalafmtCheck).value
 
 // Scalafix settings
-ThisBuild / semanticdbEnabled := true
-ThisBuild / semanticdbVersion := scalafixSemanticdb.revision
+// Disable semanticdb generation for local development when the project is
+// consumed as a checkouts/RootProject. This avoids sbt attempting to resolve
+// org.scalameta:semanticdb-scalac for the exact Scala patch version (e.g.
+// _2.12.18) which may not be published and causes resolution failures.
+ThisBuild / semanticdbEnabled := false
 
 // Header settings
 headerLicense := Some(HeaderLicense.ALv2("2021", "Qbeast Analytics, S.L."))

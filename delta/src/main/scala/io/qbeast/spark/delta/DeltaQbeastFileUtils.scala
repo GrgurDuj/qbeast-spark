@@ -48,6 +48,65 @@ private[delta] object DeltaQbeastFileUtils {
 
   /**
    * Creates an IndexFile instance from a given AddFile instance.
+   * If tags are empty, uses metadata from the cache map.
+   *
+   * @param dimensionCount
+   *   the number of the index dimensions
+   * @param metadataCache
+   *   cached metadata: path -> (revisionID, blocksString)
+   * @param addFile
+   *   the AddFile instance
+   * @return
+   *   an IndexFile instance
+   */
+  def fromAddFile(dimensionCount: Int, metadataCache: Map[String, (Long, String)])(addFile: AddFile): IndexFile = {
+    val jsonString = addFile.stats
+    val stats = jsonString match {
+      case null => None
+      case _ => Some(jsonString)
+    }
+    val builder = new IndexFileBuilder()
+      .setPath(addFile.path)
+      .setSize(addFile.size)
+      .setStats(stats)
+      .setDataChange(addFile.dataChange)
+      .setModificationTime(addFile.modificationTime)
+    
+    // Check if tags are in the old format (non-empty) or new format (empty)
+    val tagsAreEmpty = addFile.tags.isEmpty || 
+      (addFile.tags.get(TagUtils.revision).isEmpty && addFile.tags.get(TagUtils.blocks).isEmpty)
+    
+    if (tagsAreEmpty) {
+      // Try to read from the cache
+      metadataCache.get(addFile.path) match {
+        case Some((revisionID, blocksStr)) =>
+          builder.setRevisionId(revisionID)
+          if (blocksStr.nonEmpty) {
+            decodeBlocks(blocksStr, dimensionCount, builder)
+          } else {
+            builder.beginBlock().setCubeId(CubeId.root(dimensionCount)).endBlock()
+          }
+        case None =>
+          // No metadata found, use defaults
+          builder.beginBlock().setCubeId(CubeId.root(dimensionCount)).endBlock()
+      }
+    } else {
+      // Read from the old format (tags in AddFile)
+      addFile.getTag(TagUtils.revision) match {
+        case Some(value) => builder.setRevisionId(value.toLong)
+        case None =>
+      }
+      addFile.getTag(TagUtils.blocks) match {
+        case Some(value) => decodeBlocks(value, dimensionCount, builder)
+        case None => builder.beginBlock().setCubeId(CubeId.root(dimensionCount)).endBlock()
+      }
+    }
+    builder.result()
+  }
+
+  /**
+   * Creates an IndexFile instance from a given AddFile instance.
+   * Uses the old method signature for backward compatibility.
    *
    * @param dimensionCount
    *   the number of the index dimensions
@@ -81,6 +140,7 @@ private[delta] object DeltaQbeastFileUtils {
 
   /**
    * Converts a given IndexFile instance to an AddFile instance.
+   * Note: Tags include revision and blocks - these are used for the separate metadata file.
    *
    * @param indexFile
    *   the IndexFile instance

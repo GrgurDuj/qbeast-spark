@@ -41,6 +41,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.util.SerializableConfiguration
 
 import scala.collection.mutable.ListBuffer
+import com.fasterxml.jackson.databind.json.JsonMapper
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.module.scala.ClassTagExtensions
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import com.fasterxml.jackson.annotation.JsonInclude.Include
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
 
 /**
  * DeltaMetadataWriter is in charge of writing data to a table and report the necessary log
@@ -159,6 +166,44 @@ private[delta] case class DeltaMetadataWriter(
     }
   }
 
+  private def writeIndexMetadata(
+      tableID: QTableID,
+      revisionID: RevisionID,
+      timestamp: Long,
+      addFiles: Seq[AddFile]): Unit = {
+    val spark = SparkSession.active
+    val fs = FileSystem.get(spark.sessionState.newHadoopConf())
+    val indexDir = new Path(tableID.id, ".qbeast_index")
+    val tagsPath = new Path(indexDir, "tags.json")
+
+    if (!fs.exists(indexDir)) {
+      fs.mkdirs(indexDir)
+    }
+
+    val mapper = JsonMapper
+      .builder()
+      .addModule(DefaultScalaModule)
+      .serializationInclusion(Include.NON_ABSENT)
+      .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+      .build() :: ClassTagExtensions
+
+    // Convert AddFile objects to JSON, wrapping in the revision structure
+    val filesJson = mapper.writeValueAsString(addFiles)
+    val content = s"""{"revisions":[{"revisionID":$revisionID,"timestamp":$timestamp,"files":$filesJson}]}"""
+
+    val output = fs.create(tagsPath, true)
+    try {
+      output.write(content.getBytes("UTF-8"))
+    } finally {
+      output.close()
+    }
+  }
+
+  private def writeEmptyTagsToAddFiles(addFiles: Seq[AddFile]): Seq[AddFile] = {
+    // Clear tags from AddFiles before writing to Delta log to keep it clean
+    addFiles.map(af => af.copy(tags = Map.empty[String, String]))
+  }
+
   def writeWithTransaction(
       writer: String => (TableChanges, Seq[IndexFile], Seq[DeleteFile])): Unit = {
     val oldTransactions = deltaLog.unsafeVolatileSnapshot.setTransactions
@@ -184,8 +229,10 @@ private[delta] case class DeltaMetadataWriter(
       val removeFiles = deleteFiles.map(DeltaQbeastFileUtils.toRemoveFile)
 
       // Update Qbeast Metadata, e.g., Revision
+      // Use AddFiles with empty tags for Delta log to keep it clean
+      val addFilesForDeltaLog = writeEmptyTagsToAddFiles(addFiles)
       var actions =
-        updateMetadata(txn, tableChanges, addFiles, removeFiles, qbeastOptions.extraOptions)
+        updateMetadata(txn, tableChanges, addFilesForDeltaLog, removeFiles, qbeastOptions.extraOptions)
       // Set transaction identifier if specified
       for (txnVersion <- deltaOptions.txnVersion; txnAppId <- deltaOptions.txnAppId) {
         actions +:= SetTransaction(txnAppId, txnVersion, Some(System.currentTimeMillis()))
@@ -197,7 +244,7 @@ private[delta] case class DeltaMetadataWriter(
       val qbeastActions = actions.map(DeltaQbeastFileUtils.fromAction(dimensionCount))
       val tags = runPreCommitHooks(qbeastActions)
 
-      // Commit the information to the DeltaLog
+      // Commit the information to the DeltaLog with clean (empty) tags
       val op =
         DeltaOperations.Write(
           saveMode,
@@ -205,6 +252,9 @@ private[delta] case class DeltaMetadataWriter(
           deltaOptions.replaceWhere,
           deltaOptions.userMetadata)
       txn.commit(actions = actions, op = op, tags = tags)
+
+      // Write full AddFiles (with tags) to separate index metadata file
+      writeIndexMetadata(tableID, revision.revisionID, revision.timestamp, addFiles)
     }
   }
 
