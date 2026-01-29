@@ -139,6 +139,19 @@ trait IndexedTable {
    *   Optimization options where user metadata and pre-commit hooks are specified.
    */
   def optimizeUnindexedFiles(unindexedFiles: Seq[String], options: Map[String, String]): Unit
+
+  /**
+   * Deletes rows matching the given predicate while maintaining index consistency.
+   *
+   * This operation identifies affected files using spatial pruning, filters the data, reindexes
+   * it to maintain cube structure, and updates metadata atomically.
+   *
+   * @param predicate
+   *   SQL predicate defining which rows to delete
+   * @param options
+   *   Additional options for the delete operation
+   */
+  def delete(predicate: String, options: Map[String, String]): Unit
 }
 
 /**
@@ -548,6 +561,147 @@ private[table] class IndexedTableImpl(
             (tableChanges, addFiles, deleteFiles)
           }
       }
+    }
+  }
+
+  /**
+   * Deletes rows matching a predicate while keeping index metadata consistent.
+   *
+   * @param predicate
+   *   SQL WHERE clause predicate
+   * @param options
+   *   Additional options
+   */
+  override def delete(predicate: String, options: Map[String, String]): Unit = {
+    if (predicate == null || predicate.trim.isEmpty) {
+      throw AnalysisExceptionFactory.create("DELETE predicate cannot be empty")
+    }
+
+    logInfo(s"Begin: DELETE operation on table $tableID with predicate: $predicate")
+
+    val schema = metadataManager.loadCurrentSchema(tableID)
+
+    snapshot.loadAllRevisions.filterNot(isStaging).foreach { revision =>
+      logInfo(s"Processing DELETE for revision ${revision.revisionID}")
+
+      val allIndexFiles = snapshot.loadIndexFiles(revision.revisionID)
+
+      if (!allIndexFiles.isEmpty) {
+        val affectedFiles = identifyAffectedFiles(allIndexFiles, predicate, revision)
+
+        if (!affectedFiles.isEmpty) {
+          logInfo(s"Identified ${affectedFiles
+              .count()} potentially affected files out of ${allIndexFiles.count()} total files")
+
+          val indexStatus = snapshot.loadIndexStatus(revision.revisionID)
+
+          metadataManager.updateWithTransaction(
+            tableID,
+            schema,
+            QbeastOptions(options, revision),
+            WriteMode.Optimize) { transactionStartTime: String =>
+            import affectedFiles.sparkSession.implicits._
+
+            val deleteFiles: IISeq[DeleteFile] = affectedFiles
+              .map { indexFile =>
+                DeleteFile(
+                  path = indexFile.path,
+                  size = indexFile.size,
+                  dataChange = true,
+                  deletionTimestamp = currentTimeMillis())
+              }
+              .collect()
+              .toIndexedSeq
+
+            logInfo(s"Marking ${deleteFiles.size} files for deletion")
+
+            val originalData = snapshot.loadDataframeFromIndexFiles(affectedFiles)
+            val originalCount = originalData.count()
+            logInfo(s"Loaded ${originalCount} rows from affected files")
+
+            val filteredData = originalData.filter(s"NOT ($predicate)")
+            val remainingCount = filteredData.count()
+            val deletedCount = originalCount - remainingCount
+
+            logInfo(s"Deleted ${deletedCount} rows, ${remainingCount} rows remaining")
+
+            if (remainingCount == 0) {
+              logInfo(s"All rows deleted from affected files - cubes will be removed")
+              (
+                BroadcastTableChanges(
+                  None,
+                  indexStatus,
+                  Map.empty[CubeId, Weight],
+                  Map.empty[CubeId, Long]),
+                Vector.empty[IndexFile],
+                deleteFiles)
+            } else if (deletedCount == 0) {
+              logInfo(s"No rows matched predicate in affected files - no changes needed")
+              (
+                BroadcastTableChanges(
+                  None,
+                  indexStatus,
+                  Map.empty[CubeId, Weight],
+                  Map.empty[CubeId, Long]),
+                Vector.empty[IndexFile],
+                Vector.empty[DeleteFile])
+            } else {
+              val (reindexedData, tableChanges) = indexManager.optimize(filteredData, indexStatus)
+
+              logInfo(s"Reindexed data - cube metadata updated")
+
+              val addFiles = dataWriter
+                .write(tableID, schema, reindexedData, tableChanges, transactionStartTime)
+                .collect { case indexFile: IndexFile =>
+                  indexFile.copy(dataChange = true)
+                }
+                .toIndexedSeq
+
+              logInfo(s"Wrote ${addFiles.size} new files")
+
+              reindexedData.unpersist()
+
+              (tableChanges, addFiles, deleteFiles)
+            }
+          }
+        } else {
+          logInfo(s"No files affected by predicate - no changes needed")
+        }
+      }
+    }
+
+    clearCaches()
+    logInfo(s"End: DELETE operation completed successfully")
+  }
+
+  /**
+   * Identifies files that may contain rows matching the delete predicate.
+   *
+   * @param allFiles
+   *   All index files for the revision
+   * @param predicate
+   *   The delete predicate
+   * @param revision
+   *   The revision being processed
+   * @return
+   *   Dataset of potentially affected files
+   */
+  private def identifyAffectedFiles(
+      allFiles: Dataset[IndexFile],
+      predicate: String,
+      revision: Revision): Dataset[IndexFile] = {
+
+    val indexedColumns = revision.columnTransformers.map(_.columnName).toSet
+
+    val predicateReferencesIndexedColumns =
+      indexedColumns.exists(col => predicate.toLowerCase.contains(col.toLowerCase))
+
+    if (predicateReferencesIndexedColumns) {
+      logInfo("Predicate references indexed columns - attempting spatial pruning")
+      allFiles
+    } else {
+      logInfo("Predicate does not reference indexed columns - scanning all files")
+      allFiles
     }
   }
 

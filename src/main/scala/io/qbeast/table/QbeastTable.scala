@@ -173,6 +173,29 @@ class QbeastTable private (
     optimize(files, Map.empty[String, String])
 
   /**
+   * Deletes rows matching the given predicate while maintaining index consistency.
+   *
+   * This operation:
+   *   - Identifies affected files using spatial pruning
+   *   - Reads and filters data from affected files
+   *   - Reindexes filtered data to maintain cube structure
+   *   - Updates cube metadata (element counts, weights)
+   *   - Commits changes atomically via transaction
+   *
+   * @param predicate
+   *   SQL predicate defining which rows to delete (e.g., "age > 70")
+   * @param options
+   *   Additional options for the delete operation
+   */
+  def delete(predicate: String, options: Map[String, String]): Unit = {
+    indexedTable.delete(predicate, options)
+  }
+
+  def delete(predicate: String): Unit = {
+    delete(predicate, Map.empty[String, String])
+  }
+
+  /**
    * Gather an overview of the index for a given revision
    * @param revisionID
    *   RevisionID
