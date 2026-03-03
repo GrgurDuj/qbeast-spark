@@ -20,15 +20,19 @@ import io.qbeast.core.model.QbeastOptions.COLUMNS_TO_INDEX
 import io.qbeast.core.model.QbeastOptions.CUBE_SIZE
 import io.qbeast.core.model.RevisionFactory
 import io.qbeast.sources.QbeastBaseRelation
+import io.qbeast.spark.delta.IndexStatusDumper
+import io.qbeast.spark.index.IndexStatusBuilder
 import io.qbeast.IISeq
 import org.apache.spark.internal.Logging
 import org.apache.spark.qbeast.config.COLUMN_SELECTOR_ENABLED
 import org.apache.spark.qbeast.config.DEFAULT_NUMBER_OF_RETRIES
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.AnalysisExceptionFactory
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.SparkSession
 
 import java.lang.System.currentTimeMillis
 import java.util.ConcurrentModificationException
@@ -309,7 +313,8 @@ private[table] class IndexedTableImpl(
     logTrace(s"Begin: Save table $tableID")
     val options = QbeastOptions(verifyAndUpdateParameters(parameters, Some(data)))
     val indexStatus = if (exists && append && hasQbeastMetadata) {
-      snapshot.loadLatestIndexStatus
+      val latestRevision = snapshot.loadLatestRevision
+      new IndexStatusBuilder(snapshot, latestRevision).build()
     } else {
       val revision = revisionFactory.createNewRevision(tableID, data.schema, options)
       IndexStatus(revision)
@@ -350,8 +355,7 @@ private[table] class IndexedTableImpl(
       options: QbeastOptions,
       append: Boolean): BaseRelation = {
     logTrace(s"Begin: Writing data to table $tableID")
-    val revision = indexStatus.revision
-    logDebug(s"Writing data to table $tableID with revision ${revision.revisionID}")
+    logDebug(s"Writing data to table $tableID with revision ${indexStatus.revision.revisionID}")
     var tries = DEFAULT_NUMBER_OF_RETRIES
     while (tries > 0) {
       try {
@@ -365,6 +369,17 @@ private[table] class IndexedTableImpl(
           // Trying one more time if the conflict is solvable
           tries -= 1
       }
+    }
+    // Dump a Parquet index snapshot after every write so queries can use it immediately.
+    // Use the fresh snapshot's revisions: the pre-write indexStatus may carry revisionID=0
+    // (staging) on a new table, while the committed snapshot has the real revisionID.
+    val spark = SparkSession.active
+    val freshSnapshot = metadataManager.loadSnapshot(tableID)
+    val deltaVersion = DeltaLog.forTable(spark, tableID.id).update().version
+    freshSnapshot.loadAllRevisions.filterNot(isStaging).foreach { revision =>
+      val writtenStatus = new IndexStatusBuilder(freshSnapshot, revision).build()
+      IndexStatusDumper
+        .dump(writtenStatus.cubesStatuses, tableID.id, revision.revisionID, deltaVersion)(spark)
     }
     clearCaches()
     val result = createQbeastBaseRelation()
@@ -470,7 +485,8 @@ private[table] class IndexedTableImpl(
     import files.sparkSession.implicits._
     // 2. Load the Dataframe, the latest index status and the schema
     val filesDF = snapshot.loadDataframeFromIndexFiles(files)
-    val latestIndexStatus = snapshot.loadLatestIndexStatus
+    val latestRevision = snapshot.loadLatestRevision
+    val latestIndexStatus = new IndexStatusBuilder(snapshot, latestRevision).build()
     val schema = metadataManager.loadCurrentSchema(tableID)
     val optOptions = QbeastOptions(options, latestIndexStatus.revision)
     // 3. In a transaction, update the table with the new data
@@ -515,7 +531,7 @@ private[table] class IndexedTableImpl(
         .filter(file => paths.contains(file.path))
       if (!indexFiles.isEmpty) {
         // 2. Load the Index Status for the given revision
-        val indexStatus = snapshot.loadIndexStatus(revision.revisionID)
+        val indexStatus = new IndexStatusBuilder(snapshot, revision).build()
         // 3. In the same transaction
         metadataManager
           .updateWithTransaction(
@@ -547,6 +563,13 @@ private[table] class IndexedTableImpl(
             dataExtended.unpersist()
             (tableChanges, addFiles, deleteFiles)
           }
+        val spark = SparkSession.active
+        val updatedSnapshot = metadataManager.loadSnapshot(tableID)
+        val deltaVersion = DeltaLog.forTable(spark, tableID.id).update().version
+        val optimizedStatus = new IndexStatusBuilder(updatedSnapshot, revision).build()
+        IndexStatusDumper
+          .dump(optimizedStatus.cubesStatuses, tableID.id, revision.revisionID, deltaVersion)(
+            spark)
       }
     }
   }

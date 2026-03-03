@@ -16,7 +16,6 @@
 package io.qbeast.spark.delta
 
 import io.qbeast.core.model._
-import io.qbeast.spark.index.IndexStatusBuilder
 import io.qbeast.spark.utils.MetadataConfig
 import io.qbeast.spark.utils.TagColumns
 import io.qbeast.IISeq
@@ -156,7 +155,14 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
    */
   override def loadIndexStatus(revisionID: RevisionID): IndexStatus = {
     val revision = getRevision(revisionID)
-    new IndexStatusBuilder(this, revision).build()
+    val snapshotVersion =
+      IndexStatusLoader
+        .latestSnapshotVersion(tableID.id, revisionID, snapshot.version)(SparkSession.active)
+        .getOrElse(throw new IllegalStateException(
+          s"No index snapshot found for revision $revisionID at or before version ${snapshot.version}"))
+    val cubesStatuses =
+      IndexStatusLoader.load(tableID.id, revisionID, snapshotVersion, revision)(SparkSession.active)
+    IndexStatus(revision, cubesStatuses)
   }
 
   override def loadLatestIndexFiles: Dataset[IndexFile] = loadIndexFiles(lastRevisionID)
