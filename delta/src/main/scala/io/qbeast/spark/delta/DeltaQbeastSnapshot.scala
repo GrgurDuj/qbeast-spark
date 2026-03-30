@@ -16,8 +16,10 @@
 package io.qbeast.spark.delta
 
 import io.qbeast.core.model._
+import io.qbeast.spark.index.IndexStatusBuilder
 import io.qbeast.spark.utils.MetadataConfig
 import io.qbeast.spark.utils.TagColumns
+import io.qbeast.spark.utils.TagUtils
 import io.qbeast.IISeq
 import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.fs.Path
@@ -147,22 +149,69 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
   }
 
   /**
-   * Obtains the latest IndexStatus for a given RevisionID
+   * Obtains the latest IndexStatus for a given RevisionID.
    *
-   * @param revisionID
-   *   the RevisionID
-   * @return
+   * Uses a three-way strategy:
+   *   1. No Parquet snapshot on disk → full Delta log replay (original behaviour, zero regression)
+   *   2. Snapshot is current (version matches Delta version) → pure Parquet read, no log I/O
+   *   3. Snapshot is stale → Parquet base + incremental replay of only the commits after it
+   * 
+   * Falls back to full replay if the Parquet path throws for any reason.
+   *
+   * @param revisionID the RevisionID
+   * @return the IndexStatus
    */
   override def loadIndexStatus(revisionID: RevisionID): IndexStatus = {
-    val revision = getRevision(revisionID)
-    val snapshotVersion =
-      IndexStatusLoader
-        .latestSnapshotVersion(tableID.id, revisionID, snapshot.version)(SparkSession.active)
-        .getOrElse(throw new IllegalStateException(
-          s"No index snapshot found for revision $revisionID at or before version ${snapshot.version}"))
-    val cubesStatuses =
-      IndexStatusLoader.load(tableID.id, revisionID, snapshotVersion, revision)(SparkSession.active)
-    IndexStatus(revision, cubesStatuses)
+    val revision       = getRevision(revisionID)
+    val currentVersion = snapshot.version
+    implicit val spark: SparkSession = SparkSession.active
+
+    //TODO add logic for handling reading specific snapshot version
+
+    IndexStatusLoader.latestSnapshotVersion(tableID.id, revisionID, currentVersion) match {
+
+      // No snapshot on disk -> full log replay (existing behaviour)
+      case None =>
+        new IndexStatusBuilder(this, revision).build()
+
+      // Snapshot is current -> load directly, zero Delta log I/O
+      case Some(v) if v == currentVersion =>
+        val statuses = IndexStatusLoader.load(tableID.id, revisionID, v, revision)
+        IndexStatus(revision, statuses)
+
+      // Snapshot is stale -> hybrid: base + incremental delta
+      case Some(snapVersion) =>
+        val statuses   = IndexStatusLoader.load(tableID.id, revisionID, snapVersion, revision)
+        val base       = IndexStatus(revision, statuses)
+        val deltaFiles = loadIndexFilesBetween(revisionID, snapVersion + 1, currentVersion)
+        new IndexStatusBuilder(this, revision).buildIncremental(base, deltaFiles)
+    }
+  }
+
+  /**
+   * Loads only the IndexFiles committed between fromVersion and toVersion (inclusive).
+   * Used by the hybrid loadIndexStatus to get the incremental delta on top of the
+   * Parquet snapshot.
+   */
+  private def loadIndexFilesBetween(
+      revisionID: RevisionID,
+      fromVersion: Long,
+      toVersion: Long): Dataset[IndexFile] = {
+    val dimensionCount = loadRevision(revisionID).transformations.size
+    val addFiles: Seq[AddFile] =
+      deltaLog
+        .getChanges(fromVersion)
+        .takeWhile { case (v, _) => v <= toVersion }
+        .flatMap { case (_, actions) => actions.collect { case a: AddFile => a } }
+        .filter(a =>
+          a.tags != null &&
+          a.tags.getOrElse(TagUtils.revision, "") == revisionID.toString)
+        .toSeq
+    implicit val spark: SparkSession = SparkSession.active
+    import spark.implicits._
+    spark
+      .createDataset(addFiles)
+      .map(DeltaQbeastFileUtils.fromAddFile(dimensionCount))
   }
 
   override def loadLatestIndexFiles: Dataset[IndexFile] = loadIndexFiles(lastRevisionID)

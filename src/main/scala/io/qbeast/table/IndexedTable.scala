@@ -21,7 +21,9 @@ import io.qbeast.core.model.QbeastOptions.CUBE_SIZE
 import io.qbeast.core.model.RevisionFactory
 import io.qbeast.sources.QbeastBaseRelation
 import io.qbeast.spark.delta.IndexStatusDumper
+import io.qbeast.spark.delta.IndexStatusLoader
 import io.qbeast.spark.index.IndexStatusBuilder
+import io.qbeast.spark.utils.MetadataConfig
 import io.qbeast.IISeq
 import org.apache.spark.internal.Logging
 import org.apache.spark.qbeast.config.COLUMN_SELECTOR_ENABLED
@@ -314,7 +316,7 @@ private[table] class IndexedTableImpl(
     val options = QbeastOptions(verifyAndUpdateParameters(parameters, Some(data)))
     val indexStatus = if (exists && append && hasQbeastMetadata) {
       val latestRevision = snapshot.loadLatestRevision
-      new IndexStatusBuilder(snapshot, latestRevision).build()
+      snapshot.loadIndexStatus(latestRevision.revisionID)
     } else {
       val revision = revisionFactory.createNewRevision(tableID, data.schema, options)
       IndexStatus(revision)
@@ -370,16 +372,21 @@ private[table] class IndexedTableImpl(
           tries -= 1
       }
     }
-    // Dump a Parquet index snapshot after every write so queries can use it immediately.
-    // Use the fresh snapshot's revisions: the pre-write indexStatus may carry revisionID=0
-    // (staging) on a new table, while the committed snapshot has the real revisionID.
+    // Only dump a Parquet index snapshot every SNAPSHOT_DUMP_INTERVAL commits.
+    // The hybrid read path (Parquet base + incremental Delta replay) handles the
+    // gap cheaply, so we avoid the O(N) full-build + Parquet-write on every commit.
     val spark = SparkSession.active
     val freshSnapshot = metadataManager.loadSnapshot(tableID)
     val deltaVersion = DeltaLog.forTable(spark, tableID.id).update().version
     freshSnapshot.loadAllRevisions.filterNot(isStaging).foreach { revision =>
-      val writtenStatus = new IndexStatusBuilder(freshSnapshot, revision).build()
-      IndexStatusDumper
-        .dump(writtenStatus.cubesStatuses, tableID.id, revision.revisionID, deltaVersion)(spark)
+      val latestSnap = IndexStatusLoader
+        .latestSnapshotVersion(tableID.id, revision.revisionID, deltaVersion)(spark)
+      val commitsSinceSnap = latestSnap.map(deltaVersion - _).getOrElse(Long.MaxValue)
+      if (commitsSinceSnap >= MetadataConfig.SNAPSHOT_DUMP_INTERVAL) {
+        val writtenStatus = new IndexStatusBuilder(freshSnapshot, revision).build()
+        IndexStatusDumper
+          .dump(writtenStatus.cubesStatuses, tableID.id, revision.revisionID, deltaVersion)(spark)
+      }
     }
     clearCaches()
     val result = createQbeastBaseRelation()
@@ -486,7 +493,7 @@ private[table] class IndexedTableImpl(
     // 2. Load the Dataframe, the latest index status and the schema
     val filesDF = snapshot.loadDataframeFromIndexFiles(files)
     val latestRevision = snapshot.loadLatestRevision
-    val latestIndexStatus = new IndexStatusBuilder(snapshot, latestRevision).build()
+    val latestIndexStatus = snapshot.loadIndexStatus(latestRevision.revisionID)
     val schema = metadataManager.loadCurrentSchema(tableID)
     val optOptions = QbeastOptions(options, latestIndexStatus.revision)
     // 3. In a transaction, update the table with the new data

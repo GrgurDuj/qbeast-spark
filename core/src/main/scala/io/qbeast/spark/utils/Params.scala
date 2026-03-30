@@ -37,4 +37,6 @@ object MetadataConfig {
   final val blocks = "qbeast.blocks"
   final val tags = "qbeast.tags"
   final val configuration = "qbeast.configuration"
+
+  final val SNAPSHOT_DUMP_INTERVAL: Long = 10L
 }

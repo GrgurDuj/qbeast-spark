@@ -40,6 +40,43 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
     IndexStatus(revision = revision, cubesStatuses = cubeStatus)
   }
 
+  /**
+   * Merges a base IndexStatus with index files added after the base snapshot.
+   *
+   * Per cube: elementCount is summed, maxWeight takes the minimum.
+   */
+  def buildIncremental(
+      base: IndexStatus,
+      deltaFiles: Dataset[IndexFile]): IndexStatus = {
+    val deltaCubeStatuses = cubeStatusesFromFiles(deltaFiles)
+    if (deltaCubeStatuses.isEmpty) return base
+
+    val desiredCubeSize = revision.desiredCubeSize
+    var activeStatuses = base.cubesStatuses
+    
+    deltaCubeStatuses.foreach { case (cubeId, deltaStatus) =>
+      val baseStatusOpt = activeStatuses.get(cubeId)
+      
+      val mergedCount = baseStatusOpt.map(_.elementCount).getOrElse(0L) + deltaStatus.elementCount
+      
+      val mergedWeight = Weight.min(
+        baseStatusOpt.map(_.maxWeight).getOrElse(Weight.MaxValue),
+        deltaStatus.maxWeight
+      )
+        
+      val normalizedWeight =
+        if (mergedWeight < Weight.MaxValue) mergedWeight.fraction
+        else NormalizedWeight(desiredCubeSize, mergedCount)
+        
+      activeStatuses = activeStatuses.updated(
+        cubeId, 
+        CubeStatus(cubeId, mergedWeight, normalizedWeight, mergedCount)
+      )
+    }
+    
+    IndexStatus(revision, activeStatuses)
+  }
+
   def stagingCubeStatuses: SortedMap[CubeId, CubeStatus] = {
     // All staging files belong to the root.
     // All staging blocks have elementCount=0 as no qbeast tags are present.
@@ -52,14 +89,16 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
    * @return
    *   Dataset containing cube information
    */
-  def indexCubeStatuses: SortedMap[CubeId, CubeStatus] = {
+  def indexCubeStatuses: SortedMap[CubeId, CubeStatus] =
+    cubeStatusesFromFiles(qbeastSnapshot.loadIndexFiles(revision.revisionID))
+
+  private def cubeStatusesFromFiles(
+      files: Dataset[IndexFile]): SortedMap[CubeId, CubeStatus] = {
     val builder = SortedMap.newBuilder[CubeId, CubeStatus]
     val desiredCubeSize = revision.desiredCubeSize
-    val revisionAddFiles: Dataset[IndexFile] =
-      qbeastSnapshot.loadIndexFiles(revision.revisionID)
 
-    import revisionAddFiles.sparkSession.implicits._
-    val cubeStatuses = revisionAddFiles
+    import files.sparkSession.implicits._
+    val cubeStatuses = files
       .flatMap(_.blocks)
       .groupBy($"cubeId")
       .agg(min($"maxWeight.value").as("maxWeightInt"), sum($"elementCount").as("elementCount"))
@@ -75,7 +114,6 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
       .collect()
 
     cubeStatuses.foreach(cs => builder += (cs.cubeId -> cs))
-
     builder.result()
   }
 
