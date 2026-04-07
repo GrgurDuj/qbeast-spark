@@ -74,7 +74,20 @@ private[delta] object DeltaQbeastFileUtils {
     }
     addFile.getTag(TagUtils.blocks) match {
       case Some(value) => decodeBlocks(value, dimensionCount, builder)
-      case None => builder.beginBlock().setCubeId(CubeId.root(dimensionCount)).endBlock()
+      case None =>
+        var elementCount = 0L
+        if (jsonString != null) {
+          try {
+            val parser = jsonFactory.createParser(jsonString)
+            while (!parser.isClosed && parser.nextToken() != null && elementCount == 0L) {
+              if (parser.getCurrentName == "numRecords" && parser.getCurrentToken == JsonToken.VALUE_NUMBER_INT) {
+                elementCount = parser.getLongValue
+              }
+            }
+            parser.close()
+          } catch { case _: Exception => }
+        }
+        builder.beginBlock().setCubeId(CubeId.root(dimensionCount)).setElementCount(elementCount).endBlock()
     }
     builder.result()
   }

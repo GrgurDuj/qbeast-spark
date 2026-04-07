@@ -41,6 +41,59 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
   }
 
   /**
+   * Performs Targeted Cube Invalidation. Modifies the baseline materialized 
+   * IndexStatus strictly within the spatial bounds affected by removed files.
+   */
+  def buildTargeted(
+      base: IndexStatus,
+      deltaAppends: Dataset[IndexFile],
+      deltaRemoves: Seq[String]
+  ): IndexStatus = {
+    if (deltaRemoves.isEmpty) return buildIncremental(base, deltaAppends)
+
+    import deltaAppends.sparkSession.implicits._
+    val removedPaths = deltaRemoves.toSet
+
+    // 1. Identify invalidated cubes by cross-referencing removed paths with the old snapshot
+    val oldIndexFiles = qbeastSnapshot.loadIndexFiles(revision.revisionID)
+    val invalidatedCubeStrs = oldIndexFiles
+      .filter(row => removedPaths.contains(row.path))
+      .flatMap(_.blocks.map(_.cubeId.string))
+      .distinct()
+      .collect()
+      .toSet
+      
+    val invalidatedCubes = invalidatedCubeStrs.map(revision.createCubeId)
+
+    // Determine if it is safe to do localized invalidation
+    if (invalidatedCubes.isEmpty || invalidatedCubes.size > Math.max(10, base.cubesStatuses.size * 0.4)) {
+      // It was an out-of-band deletion without appends, or a massive table compaction. 
+      // Safest and fastest path is a global O(N) rebuild.
+      return build()
+    }
+
+    // 2. Drop the invalidated cubes from the base State
+    var activeStatuses = base.cubesStatuses -- invalidatedCubes
+
+    // 3. Filter the current active allFiles down to ONLY the invalidated cubes, 
+    // explicitly REMOVING the deleted paths.
+    val activeFiles = oldIndexFiles
+        .filter(row => !removedPaths.contains(row.path))
+        .filter(row => row.blocks.exists(b => invalidatedCubeStrs.contains(b.cubeId.string)))
+
+    // 4. Recalculate strictly these specific valid cubes
+    val recalculatedCubes = cubeStatusesFromFiles(activeFiles)
+        .filter { case (cubeId, _) => invalidatedCubes.contains(cubeId) }
+
+    // 5. Merge the freshly recalculated cubes back in
+    activeStatuses = activeStatuses ++ recalculatedCubes
+    val locallyHealedBase = IndexStatus(revision, activeStatuses)
+
+    // 6. Apply the standard incremental logic on top for all new appends
+    buildIncremental(locallyHealedBase, deltaAppends)
+  }
+
+  /**
    * Merges a base IndexStatus with index files added after the base snapshot.
    *
    * Per cube: elementCount is summed, maxWeight takes the minimum.

@@ -183,35 +183,45 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
       case Some(snapVersion) =>
         val statuses   = IndexStatusLoader.load(tableID.id, revisionID, snapVersion, revision)
         val base       = IndexStatus(revision, statuses)
-        val deltaFiles = loadIndexFilesBetween(revisionID, snapVersion + 1, currentVersion)
-        new IndexStatusBuilder(this, revision).buildIncremental(base, deltaFiles)
+        val (deltaAppends, deltaRemoves) = loadChangesBetween(revisionID, snapVersion + 1, currentVersion)
+        new IndexStatusBuilder(this, revision).buildTargeted(base, deltaAppends, deltaRemoves)
     }
   }
 
   /**
-   * Loads only the IndexFiles committed between fromVersion and toVersion (inclusive).
+   * Loads the IndexFiles (appends) and Paths (removes) committed between fromVersion and toVersion.
    * Used by the hybrid loadIndexStatus to get the incremental delta on top of the
    * Parquet snapshot.
    */
-  private def loadIndexFilesBetween(
+  private def loadChangesBetween(
       revisionID: RevisionID,
       fromVersion: Long,
-      toVersion: Long): Dataset[IndexFile] = {
+      toVersion: Long): (Dataset[IndexFile], Seq[String]) = {
+    import org.apache.spark.sql.delta.actions.{AddFile, RemoveFile}
     val dimensionCount = loadRevision(revisionID).transformations.size
-    val addFiles: Seq[AddFile] =
-      deltaLog
-        .getChanges(fromVersion)
-        .takeWhile { case (v, _) => v <= toVersion }
-        .flatMap { case (_, actions) => actions.collect { case a: AddFile => a } }
-        .filter(a =>
-          a.tags != null &&
-          a.tags.getOrElse(TagUtils.revision, "") == revisionID.toString)
-        .toSeq
+    
+    val changes = deltaLog
+      .getChanges(fromVersion)
+      .takeWhile { case (v, _) => v <= toVersion }
+      .flatMap { case (_, actions) => actions }
+      .toSeq
+
+    val addFiles: Seq[AddFile] = changes
+      .collect { case a: AddFile => a }
+      .filter(a =>
+        a.tags == null ||
+        a.tags.isEmpty ||
+        a.tags.getOrElse(TagUtils.revision, "") == revisionID.toString)
+        
+    val removeFiles: Seq[String] = changes.collect { case r: RemoveFile => r.path }
+
     implicit val spark: SparkSession = SparkSession.active
     import spark.implicits._
-    spark
+    val indexFiles = spark
       .createDataset(addFiles)
       .map(DeltaQbeastFileUtils.fromAddFile(dimensionCount))
+      
+    (indexFiles, removeFiles)
   }
 
   override def loadLatestIndexFiles: Dataset[IndexFile] = loadIndexFiles(lastRevisionID)
@@ -220,7 +230,7 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
     val dimensionCount = loadRevision(revisionID).transformations.size
     val addFiles =
       if (isStaging(revisionID)) loadStagingFiles()
-      else snapshot.allFiles.where(TagColumns.revision === lit(revisionID.toString))
+      else snapshot.allFiles.where(TagColumns.revision === lit(revisionID.toString) || (TagColumns.revision.isNull && lit(revisionID) === lit(lastRevisionID)))
     import addFiles.sparkSession.implicits._
     addFiles.map(DeltaQbeastFileUtils.fromAddFile(dimensionCount))
   }
