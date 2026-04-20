@@ -372,9 +372,7 @@ private[table] class IndexedTableImpl(
           tries -= 1
       }
     }
-    // Only dump a Parquet index snapshot every SNAPSHOT_DUMP_INTERVAL commits.
-    // The hybrid read path (Parquet base + incremental Delta replay) handles the
-    // gap cheaply, so we avoid the O(N) full-build + Parquet-write on every commit.
+    // Dump a Parquet index snapshot when enough commits have accumulated
     val spark = SparkSession.active
     val freshSnapshot = metadataManager.loadSnapshot(tableID)
     val deltaVersion = DeltaLog.forTable(spark, tableID.id).update().version

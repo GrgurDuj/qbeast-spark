@@ -26,7 +26,6 @@ import scala.collection.immutable.SortedMap
 /**
  * Persists an IndexStatus snapshot to Parquet under
  * `<tableBasePath>/_qbeast/index_snapshots/revision=<id>/version=<ver>/`.
- * Writes are idempotent (SaveMode.Overwrite).
  */
 object IndexStatusDumper {
 

@@ -41,20 +41,28 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
   }
 
   /**
-   * Performs Targeted Cube Invalidation. Modifies the baseline materialized 
-   * IndexStatus strictly within the spatial bounds affected by removed files.
+   * Builds the index status by invalidating only the cubes affected by removed files,
+   * then applying new appends incrementally.
+   *
+   * @param base
+   *   the baseline IndexStatus from a Parquet snapshot
+   * @param deltaAppends
+   *   files added since the snapshot
+   * @param deltaRemoves
+   *   paths of files removed since the snapshot
+   * @return
+   *   the updated IndexStatus
    */
   def buildTargeted(
       base: IndexStatus,
       deltaAppends: Dataset[IndexFile],
-      deltaRemoves: Seq[String]
-  ): IndexStatus = {
+      deltaRemoves: Seq[String]): IndexStatus = {
     if (deltaRemoves.isEmpty) return buildIncremental(base, deltaAppends)
 
     import deltaAppends.sparkSession.implicits._
     val removedPaths = deltaRemoves.toSet
 
-    // 1. Identify invalidated cubes by cross-referencing removed paths with the old snapshot
+    // Identify cubes touched by the removed files
     val oldIndexFiles = qbeastSnapshot.loadIndexFiles(revision.revisionID)
     val invalidatedCubeStrs = oldIndexFiles
       .filter(row => removedPaths.contains(row.path))
@@ -62,41 +70,65 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
       .distinct()
       .collect()
       .toSet
-      
+
     val invalidatedCubes = invalidatedCubeStrs.map(revision.createCubeId)
 
-    // Determine if it is safe to do localized invalidation
-    if (invalidatedCubes.isEmpty || invalidatedCubes.size > Math.max(10, base.cubesStatuses.size * 0.4)) {
-      // It was an out-of-band deletion without appends, or a massive table compaction. 
-      // Safest and fastest path is a global O(N) rebuild.
+    // Fall back to full rebuild when too many cubes are affected
+    if (invalidatedCubes.isEmpty ||
+      invalidatedCubes.size > Math.max(10, base.cubesStatuses.size * 0.4)) {
       return build()
     }
 
-    // 2. Drop the invalidated cubes from the base State
+    // Drop invalidated cubes and keep only non-removed files that overlap them
     var activeStatuses = base.cubesStatuses -- invalidatedCubes
-
-    // 3. Filter the current active allFiles down to ONLY the invalidated cubes, 
-    // explicitly REMOVING the deleted paths.
     val activeFiles = oldIndexFiles
-        .filter(row => !removedPaths.contains(row.path))
-        .filter(row => row.blocks.exists(b => invalidatedCubeStrs.contains(b.cubeId.string)))
+      .filter(row => !removedPaths.contains(row.path))
+      .filter(row => row.blocks.exists(b => invalidatedCubeStrs.contains(b.cubeId.string)))
 
-    // 4. Recalculate strictly these specific valid cubes
+    // Recalculate only the affected cubes and merge back
     val recalculatedCubes = cubeStatusesFromFiles(activeFiles)
-        .filter { case (cubeId, _) => invalidatedCubes.contains(cubeId) }
-
-    // 5. Merge the freshly recalculated cubes back in
+      .filter { case (cubeId, _) => invalidatedCubes.contains(cubeId) }
     activeStatuses = activeStatuses ++ recalculatedCubes
-    val locallyHealedBase = IndexStatus(revision, activeStatuses)
 
-    // 6. Apply the standard incremental logic on top for all new appends
-    buildIncremental(locallyHealedBase, deltaAppends)
+    // Apply new appends on top
+    buildIncremental(IndexStatus(revision, activeStatuses), deltaAppends)
+  }
+
+  private def cubeStatusesFromFiles(files: Dataset[IndexFile]): Map[CubeId, CubeStatus] = {
+    val desiredCubeSize = revision.desiredCubeSize
+    import files.sparkSession.implicits._
+    
+    files
+      .flatMap(_.blocks)
+      .groupBy($"cubeId")
+      .agg(
+        min($"maxWeight.value").as("maxWeightInt"), 
+        sum($"elementCount").as("elementCount")
+      )
+      .withColumn(
+        "normalizedWeight",
+        when(
+          $"maxWeightInt" < Weight.MaxValueColumn,
+          NormalizedWeight.fromWeightColumn($"maxWeightInt")
+        ).otherwise(NormalizedWeight.fromColumns(lit(desiredCubeSize), $"elementCount"))
+      )
+      .withColumn("maxWeight", struct($"maxWeightInt".as("value")))
+      .drop($"maxWeightInt")
+      .as[CubeStatus]
+      .collect()
+      .map(cs => (cs.cubeId, cs))
+      .toMap
   }
 
   /**
    * Merges a base IndexStatus with index files added after the base snapshot.
    *
-   * Per cube: elementCount is summed, maxWeight takes the minimum.
+   * @param base
+   *   the baseline IndexStatus
+   * @param deltaFiles
+   *   files added since the baseline
+   * @return
+   *   the merged IndexStatus
    */
   def buildIncremental(
       base: IndexStatus,
@@ -142,16 +174,14 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
    * @return
    *   Dataset containing cube information
    */
-  def indexCubeStatuses: SortedMap[CubeId, CubeStatus] =
-    cubeStatusesFromFiles(qbeastSnapshot.loadIndexFiles(revision.revisionID))
-
-  private def cubeStatusesFromFiles(
-      files: Dataset[IndexFile]): SortedMap[CubeId, CubeStatus] = {
+  def indexCubeStatuses: SortedMap[CubeId, CubeStatus] = {
     val builder = SortedMap.newBuilder[CubeId, CubeStatus]
     val desiredCubeSize = revision.desiredCubeSize
+    val revisionAddFiles: Dataset[IndexFile] =
+      qbeastSnapshot.loadIndexFiles(revision.revisionID)
 
-    import files.sparkSession.implicits._
-    val cubeStatuses = files
+    import revisionAddFiles.sparkSession.implicits._
+    val cubeStatuses = revisionAddFiles
       .flatMap(_.blocks)
       .groupBy($"cubeId")
       .agg(min($"maxWeight.value").as("maxWeightInt"), sum($"elementCount").as("elementCount"))
@@ -167,6 +197,7 @@ class IndexStatusBuilder(qbeastSnapshot: QbeastSnapshot, revision: Revision)
       .collect()
 
     cubeStatuses.foreach(cs => builder += (cs.cubeId -> cs))
+
     builder.result()
   }
 

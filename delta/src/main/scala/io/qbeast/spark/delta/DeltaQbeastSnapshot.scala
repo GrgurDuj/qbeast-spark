@@ -151,47 +151,50 @@ case class DeltaQbeastSnapshot(tableID: QTableID) extends QbeastSnapshot with De
   /**
    * Obtains the latest IndexStatus for a given RevisionID.
    *
-   * Uses a three-way strategy:
-   *   1. No Parquet snapshot on disk → full Delta log replay (original behaviour, zero regression)
-   *   2. Snapshot is current (version matches Delta version) → pure Parquet read, no log I/O
-   *   3. Snapshot is stale → Parquet base + incremental replay of only the commits after it
-   * 
-   * Falls back to full replay if the Parquet path throws for any reason.
+   * If a Parquet snapshot is available it is used as baseline, replaying only
+   * the Delta commits after it. Otherwise falls back to full log replay.
    *
-   * @param revisionID the RevisionID
-   * @return the IndexStatus
+   * @param revisionID
+   *   the RevisionID
+   * @return
+   *   the IndexStatus
    */
   override def loadIndexStatus(revisionID: RevisionID): IndexStatus = {
-    val revision       = getRevision(revisionID)
+    val revision = getRevision(revisionID)
     val currentVersion = snapshot.version
     implicit val spark: SparkSession = SparkSession.active
 
-    //TODO add logic for handling reading specific snapshot version
+    // TODO add logic for handling reading specific snapshot version
 
     IndexStatusLoader.latestSnapshotVersion(tableID.id, revisionID, currentVersion) match {
 
-      // No snapshot on disk -> full log replay (existing behaviour)
       case None =>
         new IndexStatusBuilder(this, revision).build()
 
-      // Snapshot is current -> load directly, zero Delta log I/O
       case Some(v) if v == currentVersion =>
         val statuses = IndexStatusLoader.load(tableID.id, revisionID, v, revision)
         IndexStatus(revision, statuses)
 
-      // Snapshot is stale -> hybrid: base + incremental delta
       case Some(snapVersion) =>
-        val statuses   = IndexStatusLoader.load(tableID.id, revisionID, snapVersion, revision)
-        val base       = IndexStatus(revision, statuses)
-        val (deltaAppends, deltaRemoves) = loadChangesBetween(revisionID, snapVersion + 1, currentVersion)
+        val statuses = IndexStatusLoader.load(tableID.id, revisionID, snapVersion, revision)
+        val base = IndexStatus(revision, statuses)
+        val (deltaAppends, deltaRemoves) =
+          loadChangesBetween(revisionID, snapVersion + 1, currentVersion)
         new IndexStatusBuilder(this, revision).buildTargeted(base, deltaAppends, deltaRemoves)
     }
   }
 
   /**
-   * Loads the IndexFiles (appends) and Paths (removes) committed between fromVersion and toVersion.
-   * Used by the hybrid loadIndexStatus to get the incremental delta on top of the
-   * Parquet snapshot.
+   * Loads the appended IndexFiles and removed paths between two Delta versions.
+   *
+   * @param revisionID
+   *   the revision to filter by
+   * @param fromVersion
+   *   first Delta version (inclusive)
+   * @param toVersion
+   *   last Delta version (inclusive)
+   * @return
+   *   a tuple of (appended IndexFiles, removed file paths)
    */
   private def loadChangesBetween(
       revisionID: RevisionID,

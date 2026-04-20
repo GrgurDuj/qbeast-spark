@@ -27,7 +27,7 @@ import scala.collection.immutable.SortedMap
 import scala.util.matching.Regex
 
 /**
- * Loads an IndexStatus snapshot previously written by [[IndexStatusDumper]] from Parquet.
+ * Loads an IndexStatus snapshot previously written by IndexStatusDumper.
  */
 object IndexStatusLoader {
 
@@ -64,7 +64,7 @@ object IndexStatusLoader {
   }
 
   /**
-   * Loads cube statuses from a Parquet snapshot written by [[IndexStatusDumper]].
+   * Loads cube statuses from a Parquet snapshot.
    */
   def load(
       tableBasePath: String,
